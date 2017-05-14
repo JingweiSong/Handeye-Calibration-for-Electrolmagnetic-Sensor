@@ -1,0 +1,163 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%   Function: Implement handeye calibration
+%   Method:   Improved version; Observation (EM sensor) is also regarded as
+%             variables
+%   Input:    
+%             Num_frame:    Number of frames
+%             Num_corner:   Number of corner points
+%             Re_g:         Rotation of EM sensor (GlobalPos). 3*3
+%             Te_g:         Translation of EM sensor (GlobalPos).3*1
+%             Puv_g:        Position of each corner.(GlobalPos).3*Num_corner
+%             Puv_c_0:     Position of each corner.(CameraPos).3*Num_corner
+%             squareSize:   Size of the square in chekerboard
+%             cameraParams: Camera parameter
+%   Returns:  
+%             Rc_e:         Rotation from EM sensor to camera
+%             Tc_e:         Translation from EM sensor to camera
+%   Author:   Jingwei Song.   23/04/2017 to ...
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+clc;clear all;close all;
+
+DEBUG = 0;
+
+% =============== Parameter settering =================== %
+dataset_path     ='D:\WORK\medical SLAM\Ó²¼ş\data\';
+load data_index;
+load chkBoard.mat
+load Puv_c_0.mat
+Num_frame  = size(data_index,1);
+num_row    = 6;
+num_col    = 9;
+Num_corner = 54;    %   6 by 9
+squareSize = 35/9;    %   Square size of checkerboard (in millimeters)
+% ------------------------------------------------------- %
+
+chkBoard1 = zeros(size(chkBoard));
+for i = 1 : 9
+    for j = 1 : 6
+        chkBoard1((i-1)*6+j,:) = chkBoard(i*6-(j-1),:);
+    end
+end
+chkBoard = chkBoard1;clear chkBoard1;
+% ------------ end debug ----------------------------  %
+ tmp = chkBoard(:,2:4);
+ [chkBoard error] = getGlobalPosCheckerboard(tmp,num_row,num_col,squareSize); %   Convert measured
+ disp('Overall error of checkboard estimation (mm):')
+ error
+
+
+%   Get emsensor Rotation and translation
+emsensor=load([dataset_path 'pose.txt']);
+ Re_g = zeros(3,3,Num_frame);
+ Te_g = zeros(Num_frame,3);
+ for i = 1 : Num_frame
+      Re_g(:,:,i) = quat2rotm(emsensor(data_index(i),4:7));
+      Te_g(i,:)   = emsensor(data_index(i),1:3);
+ end
+% ---------------------------------------------------------%
+
+%%  Optimization Rc_e and Tc_e
+%   Initialize
+x = zeros(Num_frame*6+6,1);
+Rc_e = eye(3,3);    %   EM to camera
+Re   = zeros(3,3,Num_frame);
+for i = 1:Num_frame
+    Re(:,:,i) = eye(3,3);
+end
+
+
+%  #define
+if(DEBUG == 1)
+    M       = zeros(Num_corner,3,Num_frame);
+    %   Calculate M(Num_corner,3,Num_frame)
+    for i = 1:Num_frame
+        for j = 1:Num_corner
+            M(j,:,i) = Re_g(:,:,i)'* (chkBoard(j,:)' - Te_g(i,:)');
+        end
+    end
+    
+    figure
+    plotCamera('Location',[0 0 0],'Orientation',eye(3,3),'Size',5);
+    hold on
+    pcshow(M(:,:,1), ...
+        'VerticalAxisDir','down','MarkerSize',30);
+    pcshow(Puv_c_0(:,:,1), ...
+        'VerticalAxisDir','down','MarkerSize',30);  
+    hold on
+    pcshow(M(1,:,1),'MarkerSize',100);
+    hold on
+    pcshow(Puv_c_0(1,:,1),'MarkerSize',100);
+end
+
+
+%   Define weight
+weight_rotm = 100000000; 
+weight_tran = 1000000;
+weight_main = 1;
+weightdiag = ones(3*Num_frame*Num_corner+Num_frame*6,1);
+weightdiag(1:3*Num_frame*Num_corner) = weight_main * weightdiag(1:3*Num_frame*Num_corner);
+for i = 1 : Num_frame
+    weightdiag(3*Num_frame*Num_corner+6*(i-1)+1:3*Num_frame*Num_corner+6*(i-1)+6) = [weight_rotm*[1 1 1] weight_tran*[1 1 1]];
+end
+P = diag(weightdiag);
+
+
+F = CalculateF_improve( Rc_e,x,Re_g,Te_g,Puv_c_0,Num_frame,Num_corner,chkBoard);
+J = CalculateJ_improve( Rc_e,x,Re_g,Te_g,Puv_c_0,Num_frame,Num_corner,chkBoard );
+min_FX_old = 10000000000000;
+k=0;
+I = eye(size(J,2));
+threshold = 0.00000000000001;
+while ((F'*P*F)>threshold&&abs(F'*P*F-min_FX_old)>threshold&&k<100)
+    u = 0.0001;
+    min_FX_old = F'*P*F
+    J = sparse(J);  
+    F = sparse(F);
+    
+    d = -(J'*P*J)\(J'*P*F);
+    x_new = x + d;
+    Rc_e_new = Rc_e*expm(skew(d(end-5:end-3)));
+    F_new = CalculateF_improve( Rc_e_new,x_new,Re_g,Te_g,Puv_c_0,Num_frame,Num_corner,chkBoard );
+    min_FX = F_new'*P*F_new;
+    t = 1;
+    while(min_FX > min_FX_old&&t<10)
+        d = -(J'*P*J)\(J'*P*F);
+        x_new = x + d;
+        Rc_e_new = Rc_e*expm(skew(d(end-5:end-3)));
+        F_new = CalculateF_improve( Rc_e_new,x_new,Re_g,Te_g,Puv_c_0,Num_frame,Num_corner,chkBoard );
+        min_FX = F_new'*P*F_new;
+        u  = u * 10;
+        t =  t + 1;
+    end
+    if(t==10)
+        break
+    end
+    x = x + d;
+    Rc_e = Rc_e*expm(skew(d(end-5:end-3)));
+    k=k+1;
+    F = CalculateF_improve( Rc_e,x,Re_g,Te_g,Puv_c_0,Num_frame,Num_corner,chkBoard );
+    J = CalculateJ_improve( Rc_e,x,Re_g,Te_g,Puv_c_0,Num_frame,Num_corner,chkBoard );
+end
+
+%   Calculate M(Num_corner,3,Num_frame)
+M     = zeros(Num_corner,3,Num_frame);
+for i = 1:Num_frame
+    for j = 1:Num_corner
+        d = x(6*(i-1)+1:6*(i-1)+3);
+%         d = [0 0 0];
+        M(j,:,i) = Re_g(:,:,i)'* expm(skew(d))* (chkBoard(j,:)' - Te_g(i,:)' + x(6*(i-1)+4:6*(i-1)+6));
+    end
+end
+Tc_e = x(end-2:end);
+error = 0;
+for i = 1 : Num_frame
+    for j = 1 : Num_corner
+        tmp = Rc_e*M(j,:,i)'+Tc_e-Puv_c_0(j,:,i)';
+        error = error + sqrt(tmp'*tmp);
+    end
+end
+error = error / (Num_corner*Num_frame);
+Rc_e
+x(4:6)
+disp('Overall error of checkboard estimation (mm):')
+error
